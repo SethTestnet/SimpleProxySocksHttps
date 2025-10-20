@@ -113,14 +113,3 @@ sudo ufw delete allow 3128/tcp
 ```
 
 ---
-
-## 🧩 Проверено
-
-✅ Ubuntu 22.04 LTS
-✅ Ubuntu 24.04 LTS
-✅ Работает на чистом VPS (VDSina, Hetzner, Contabo, OVH, DigitalOcean и др.)
-
----
-
-**Автор:** [@<YOUR_GH_USERNAME>](https://github.com/<YOUR_GH_USERNAME>)
-Лицензия: MIT
