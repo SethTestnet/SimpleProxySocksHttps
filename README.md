@@ -17,10 +17,8 @@
 Запускать на чистом VPS (Ubuntu 22.04/24.04, от root):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<YOUR_GH_USERNAME>/<YOUR_REPO>/main/install_3proxy_socks5_https.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/SethTestnet/SimpleProxySocksHttps/main/install_3proxy_socks5_https.sh)
 ```
-
-> 🔸 Замени `<YOUR_GH_USERNAME>` и `<YOUR_REPO>` на свои реальные значения.
 
 Скрипт спросит:
 
