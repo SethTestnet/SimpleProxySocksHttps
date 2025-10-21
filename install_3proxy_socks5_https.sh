@@ -129,6 +129,11 @@ else
   warn "UFW не найден, порты не открывались"
 fi
 
+# autodetect server IPv4
+SERVER_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+[[ -z "$SERVER_IP" ]] && SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[[ -z "$SERVER_IP" ]] && SERVER_IP="$(curl -4 -fsS ifconfig.co 2>/dev/null || true)"
+
 cat <<MSG
 
 ==========================================
@@ -142,11 +147,15 @@ HTTPS (HTTP CONNECT)-прокси:
 
 Логин:    $USER_NAME
 Пароль:   $PASSWD
-IP:       $(hostname -I | awk '{print $1}')
+IP:       ${SERVER_IP:-<не определён>}
+
+Доступ (строки для быстрого копирования):
+  SOCKS5  →  socks5://$USER_NAME:$PASSWD@$SERVER_IP:$SOCKS_PORT
+  HTTPS   →  http://$USER_NAME:$PASSWD@$SERVER_IP:$HTTP_PORT
 
 Проверка:
-  curl -v --socks5-hostname '$USER_NAME:$PASSWD'@<IP>:$SOCKS_PORT https://ifconfig.co
-  curl -v -x http://$USER_NAME:$PASSWD@<IP>:$HTTP_PORT https://ifconfig.co
+  curl -v --socks5-hostname '$USER_NAME:$PASSWD'@${SERVER_IP:-<IP>}:$SOCKS_PORT https://ifconfig.co
+  curl -v -x http://$USER_NAME:$PASSWD@${SERVER_IP:-<IP>}:$HTTP_PORT https://ifconfig.co
 
 Файлы:
   Конфиг: $CONF_FILE
@@ -156,6 +165,6 @@ IP:       $(hostname -I | awk '{print $1}')
 Команды:
   sudo systemctl status 3proxy --no-pager
   sudo systemctl restart 3proxy
-  sudo tail -f $LOG_DIR/3proxy.log
+  sudo tail -f $LOG_DIR/3proxy/3proxy.log
 ==========================================
 MSG
