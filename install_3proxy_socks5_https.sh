@@ -165,6 +165,6 @@ IP:       ${SERVER_IP:-<не определён>}
 Команды:
   sudo systemctl status 3proxy --no-pager
   sudo systemctl restart 3proxy
-  sudo tail -f $LOG_DIR/3proxy/3proxy.log
+  sudo tail -f $LOG_DIR/3proxy.log
 ==========================================
 MSG
