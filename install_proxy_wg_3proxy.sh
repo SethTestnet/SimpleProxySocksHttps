@@ -2,18 +2,26 @@
 set -Eeuo pipefail
 
 # ============================================================
-# SimpleProxySocksHttps + WireGuard private access installer
+# SimpleProxySocksHttps
+# WireGuard + 3proxy private proxy installer
+#
 # Ubuntu 22.04 / 24.04
 #
 # Result:
 #   WireGuard server: 10.66.66.1/24
-#   Client:           10.66.66.2/32
+#   WireGuard client: 10.66.66.2/32
 #   SOCKS5 proxy:     10.66.66.1:1080
 #   HTTP proxy:       10.66.66.1:3128
 #
 # Public internet:
-#   OPEN:  22/tcp, 51820/udp
+#   OPEN:   22/tcp, 51820/udp
 #   CLOSED: 1080/tcp, 3128/tcp
+#
+# Client WireGuard AllowedIPs:
+#   10.66.66.1/32
+#
+# This means WireGuard does NOT route all client traffic.
+# It only gives access to the private proxy address.
 # ============================================================
 
 WG_IFACE="wg0"
@@ -34,7 +42,7 @@ THREEPROXY_BIN="${THREEPROXY_DIR}/bin/3proxy"
 THREEPROXY_LOG_DIR="/var/log/3proxy"
 
 WG_DIR="/etc/wireguard"
-CLIENT_CONF_PATH="/root/wg-client-thai-proxy.conf"
+CLIENT_CONF_PATH="/root/wg-client-private-proxy.conf"
 INFO_PATH="/root/proxy-info.txt"
 
 RED=$'\033[0;31m'
@@ -57,30 +65,40 @@ warn() {
 
 need_root() {
   if [[ "${EUID}" -ne 0 ]]; then
-    die "Запусти от root: sudo bash install_proxy_wg_3proxy.sh"
+    die "Run as root. Example: curl -fsSL URL | sudo bash"
   fi
 }
 
 detect_os() {
   if [[ ! -f /etc/os-release ]]; then
-    die "Не найден /etc/os-release"
+    die "Cannot find /etc/os-release"
   fi
 
   # shellcheck disable=SC1091
   source /etc/os-release
 
   if [[ "${ID:-}" != "ubuntu" ]]; then
-    warn "Скрипт рассчитан на Ubuntu. Сейчас ID=${ID:-unknown}. Продолжаю, но без гарантий."
+    warn "This script is tested on Ubuntu. Current OS: ${ID:-unknown}. Continuing anyway."
   fi
 }
 
 ask_default() {
   local prompt="$1"
   local default="$2"
-  local value
+  local value=""
 
   read -r -p "${prompt} [${default}]: " value || true
   echo "${value:-$default}"
+}
+
+ask_yes_no_default_yes() {
+  local prompt="$1"
+  local value=""
+
+  read -r -p "${prompt} [Y/n]: " value || true
+  value="${value:-Y}"
+
+  [[ "$value" =~ ^[Yy]$|^[Yy][Ee][Ss]$ ]]
 }
 
 generate_password() {
@@ -94,32 +112,34 @@ valid_port() {
 
 detect_public_ip() {
   local ip=""
-  ip="$(curl -4fsSL --max-time 5 https://ifconfig.co 2>/dev/null || true)"
+
+  ip="$(curl -4fsSL --max-time 7 https://ifconfig.co 2>/dev/null || true)"
   if [[ -z "$ip" ]]; then
-    ip="$(curl -4fsSL --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+    ip="$(curl -4fsSL --max-time 7 https://api.ipify.org 2>/dev/null || true)"
   fi
   if [[ -z "$ip" ]]; then
-    ip="$(curl -4fsSL --max-time 5 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)"
+    ip="$(curl -4fsSL --max-time 7 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)"
   fi
-  [[ -n "$ip" ]] || die "Не смог определить публичный IPv4 сервера"
+
+  [[ -n "$ip" ]] || die "Cannot detect public IPv4 address"
   echo "$ip"
 }
 
-detect_default_iface() {
-  ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1
-}
-
-detect_private_ip() {
-  local iface="$1"
-  ip -4 addr show dev "$iface" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1
-}
-
 install_packages() {
-  info "Обновляю систему и ставлю зависимости"
+  local do_upgrade="$1"
 
+  info "Updating apt cache"
   export DEBIAN_FRONTEND=noninteractive
 
   apt-get update -y
+
+  if [[ "$do_upgrade" == "yes" ]]; then
+    info "Upgrading installed packages"
+    apt-get upgrade -y
+  fi
+
+  info "Installing dependencies"
+
   apt-get install -y \
     curl \
     wget \
@@ -144,7 +164,7 @@ create_swap_if_needed() {
 
   if (( mem_kb < 900000 )); then
     if [[ ! -f /swapfile ]]; then
-      info "Мало RAM, создаю swap 1G"
+      info "Low RAM detected. Creating 1G swap"
       fallocate -l 1G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=1024
       chmod 600 /swapfile
       mkswap /swapfile
@@ -154,18 +174,27 @@ create_swap_if_needed() {
         echo '/swapfile none swap sw 0 0' >> /etc/fstab
       fi
     else
-      warn "Swap уже существует, пропускаю"
+      warn "Swap file already exists. Skipping swap creation"
     fi
   fi
 }
 
+stop_old_services() {
+  info "Stopping old services if they exist"
+
+  systemctl stop 3proxy 2>/dev/null || true
+  systemctl stop "wg-quick@${WG_IFACE}" 2>/dev/null || true
+
+  pkill -f "${THREEPROXY_BIN}" 2>/dev/null || true
+}
+
 install_3proxy() {
-  info "Ставлю 3proxy ${THREEPROXY_VERSION}"
+  info "Installing 3proxy ${THREEPROXY_VERSION}"
 
   local workdir="/tmp/3proxy-build"
+
   rm -rf "$workdir"
   mkdir -p "$workdir"
-
   cd "$workdir"
 
   wget -q "https://github.com/3proxy/3proxy/archive/refs/tags/${THREEPROXY_VERSION}.tar.gz" -O 3proxy.tar.gz
@@ -182,11 +211,12 @@ install_3proxy() {
     useradd --system --no-create-home --shell /usr/sbin/nologin 3proxy
   fi
 
-  chown -R 3proxy:3proxy "${THREEPROXY_LOG_DIR}"
+  chown -R 3proxy:3proxy "${THREEPROXY_DIR}" "${THREEPROXY_LOG_DIR}"
+  chmod 755 "${THREEPROXY_LOG_DIR}"
 }
 
 configure_sysctl() {
-  info "Настраиваю sysctl"
+  info "Configuring sysctl"
 
   cat >/etc/sysctl.d/99-simple-proxy.conf <<EOF
 net.ipv4.ip_forward=1
@@ -196,8 +226,27 @@ EOF
   sysctl --system >/dev/null
 }
 
+backup_old_configs() {
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+
+  if [[ -f "${WG_DIR}/${WG_IFACE}.conf" ]]; then
+    cp "${WG_DIR}/${WG_IFACE}.conf" "${WG_DIR}/${WG_IFACE}.conf.backup-${ts}"
+  fi
+
+  if [[ -f "${THREEPROXY_CFG}" ]]; then
+    cp "${THREEPROXY_CFG}" "${THREEPROXY_CFG}.backup-${ts}"
+  fi
+
+  if [[ -f "${CLIENT_CONF_PATH}" ]]; then
+    cp "${CLIENT_CONF_PATH}" "${CLIENT_CONF_PATH}.backup-${ts}"
+  fi
+}
+
 configure_wireguard() {
-  info "Настраиваю WireGuard"
+  local public_ip="$1"
+
+  info "Configuring WireGuard"
 
   mkdir -p "${WG_DIR}"
   chmod 700 "${WG_DIR}"
@@ -230,7 +279,7 @@ Address = ${WG_CLIENT_CIDR}
 
 [Peer]
 PublicKey = ${server_public}
-Endpoint = SERVER_PUBLIC_IP:${WG_PORT}
+Endpoint = ${public_ip}:${WG_PORT}
 AllowedIPs = ${WG_SERVER_IP}/32
 PersistentKeepalive = 25
 EOF
@@ -241,18 +290,26 @@ EOF
 configure_3proxy() {
   local proxy_user="$1"
   local proxy_pass="$2"
-  local external_ip="$3"
 
-  info "Настраиваю 3proxy"
+  info "Configuring 3proxy"
 
   mkdir -p "${THREEPROXY_CFG_DIR}" "${THREEPROXY_LOG_DIR}"
 
   cat >"${THREEPROXY_CFG}" <<EOF
 # ============================================================
 # 3proxy config
+#
 # Proxy listens only on WireGuard IP: ${WG_SERVER_IP}
-# SOCKS5: ${WG_SERVER_IP}:${SOCKS_PORT}
-# HTTP:   ${WG_SERVER_IP}:${HTTP_PORT}
+#
+# SOCKS5:
+#   ${WG_SERVER_IP}:${SOCKS_PORT}
+#
+# HTTP / HTTPS CONNECT:
+#   ${WG_SERVER_IP}:${HTTP_PORT}
+#
+# Important:
+#   No "external" directive is used.
+#   The OS chooses the correct outbound interface automatically.
 # ============================================================
 
 daemon
@@ -270,7 +327,6 @@ users ${proxy_user}:CL:${proxy_pass}
 allow ${proxy_user}
 
 internal ${WG_SERVER_IP}
-external ${external_ip}
 
 socks -p${SOCKS_PORT}
 proxy -p${HTTP_PORT}
@@ -282,7 +338,7 @@ EOF
   cat >/etc/systemd/system/3proxy.service <<EOF
 [Unit]
 Description=3proxy Proxy Server
-After=network-online.target ${WG_IFACE}.service wg-quick@${WG_IFACE}.service
+After=network-online.target wg-quick@${WG_IFACE}.service
 Wants=network-online.target
 
 [Service]
@@ -301,29 +357,34 @@ EOF
 }
 
 configure_firewall() {
-  info "Настраиваю UFW firewall"
+  info "Configuring UFW firewall"
 
   ufw --force reset
 
   ufw default deny incoming
   ufw default allow outgoing
 
-  # SSH оставляем открытым, иначе можно потерять доступ.
+  # SSH. On AWS, it is better to restrict this in Security Group.
   ufw allow 22/tcp comment 'SSH'
 
-  # WireGuard публично доступен.
+  # Public WireGuard port.
   ufw allow "${WG_PORT}/udp" comment 'WireGuard'
 
-  # Прокси порты НЕ открываем наружу.
-  # Они слушают только 10.66.66.1, но дополнительно явно блокируем снаружи.
+  # Allow proxy ports only through WireGuard interface.
+  # This is the key fix: without these rules, UFW can block proxy access even when WireGuard works.
+  ufw allow in on "${WG_IFACE}" to any port "${SOCKS_PORT}" proto tcp comment 'Allow SOCKS5 via WireGuard'
+  ufw allow in on "${WG_IFACE}" to any port "${HTTP_PORT}" proto tcp comment 'Allow HTTP proxy via WireGuard'
+
+  # Block public proxy access from the internet.
   ufw deny "${SOCKS_PORT}/tcp" comment 'Block public SOCKS5'
   ufw deny "${HTTP_PORT}/tcp" comment 'Block public HTTP proxy'
 
   ufw --force enable
+  ufw reload
 }
 
 start_services() {
-  info "Запускаю сервисы"
+  info "Starting services"
 
   systemctl daemon-reload
 
@@ -336,12 +397,6 @@ start_services() {
   systemctl restart 3proxy
 }
 
-patch_client_config_endpoint() {
-  local public_ip="$1"
-
-  sed -i "s/SERVER_PUBLIC_IP/${public_ip}/g" "${CLIENT_CONF_PATH}"
-}
-
 write_info_file() {
   local public_ip="$1"
   local proxy_user="$2"
@@ -349,7 +404,7 @@ write_info_file() {
 
   cat >"${INFO_PATH}" <<EOF
 ============================================================
-Thai VPS private proxy installed
+Private WireGuard + 3proxy installed
 ============================================================
 
 Public VPS IP:
@@ -363,33 +418,46 @@ WireGuard client config:
   ${CLIENT_CONF_PATH}
 
 Proxy inside WireGuard only:
+
   SOCKS5:
     socks5://${proxy_user}:${proxy_pass}@${WG_SERVER_IP}:${SOCKS_PORT}
 
   HTTP / HTTPS CONNECT:
     http://${proxy_user}:${proxy_pass}@${WG_SERVER_IP}:${HTTP_PORT}
 
-Important:
-  Do NOT open ${SOCKS_PORT}/tcp or ${HTTP_PORT}/tcp in AWS Security Group.
-  Open only:
-    22/tcp from your admin IP if possible
-    ${WG_PORT}/udp from anywhere or restricted if you know client IP
+AWS / cloud firewall:
+  Open:
+    22/tcp
+    ${WG_PORT}/udp
+
+  Do NOT open:
+    ${SOCKS_PORT}/tcp
+    ${HTTP_PORT}/tcp
 
 Client WireGuard AllowedIPs:
   ${WG_SERVER_IP}/32
 
-This means WireGuard does NOT route all traffic.
+This means WireGuard does NOT route all client traffic.
 Only traffic to ${WG_SERVER_IP} goes through WireGuard.
 
-Check services:
-  systemctl status wg-quick@${WG_IFACE}
-  systemctl status 3proxy
+Useful server commands:
 
-Check listening ports:
-  ss -lntup
+  Show WireGuard status:
+    wg show
 
-Show proxy logs:
-  tail -f ${THREEPROXY_LOG_DIR}/3proxy.log
+  Show services:
+    systemctl status wg-quick@${WG_IFACE} --no-pager
+    systemctl status 3proxy --no-pager
+
+  Show listening ports:
+    ss -lntup | grep -E '${SOCKS_PORT}|${HTTP_PORT}|${WG_PORT}'
+
+  Show UFW rules:
+    ufw status numbered
+
+  Show 3proxy logs:
+    ls -la ${THREEPROXY_LOG_DIR}
+    tail -f ${THREEPROXY_LOG_DIR}/3proxy.log.*
 
 Client config:
 ------------------------------------------------------------
@@ -407,19 +475,19 @@ print_result() {
 
   echo
   echo "${GREEN}============================================================${NC}"
-  echo "${GREEN}Готово. Прокси установлен.${NC}"
+  echo "${GREEN}Done. Private proxy installed.${NC}"
   echo "${GREEN}============================================================${NC}"
   echo
-  echo "Публичный IP VPS:"
+  echo "Public VPS IP:"
   echo "  ${public_ip}"
   echo
   echo "WireGuard client config:"
   echo "  ${CLIENT_CONF_PATH}"
   echo
-  echo "Информация сохранена:"
+  echo "Info file:"
   echo "  ${INFO_PATH}"
   echo
-  echo "Прокси доступны ТОЛЬКО через WireGuard:"
+  echo "Proxy is available ONLY through WireGuard:"
   echo
   echo "  SOCKS5:"
   echo "    socks5://${proxy_user}:${proxy_pass}@${WG_SERVER_IP}:${SOCKS_PORT}"
@@ -427,16 +495,19 @@ print_result() {
   echo "  HTTP / HTTPS:"
   echo "    http://${proxy_user}:${proxy_pass}@${WG_SERVER_IP}:${HTTP_PORT}"
   echo
-  echo "${YELLOW}Важно для AWS Security Group:${NC}"
-  echo "  Открыть: ${WG_PORT}/udp"
-  echo "  НЕ открывать наружу: ${SOCKS_PORT}/tcp и ${HTTP_PORT}/tcp"
+  echo "${YELLOW}AWS / cloud firewall:${NC}"
+  echo "  Open: ${WG_PORT}/udp"
+  echo "  Do NOT open publicly: ${SOCKS_PORT}/tcp and ${HTTP_PORT}/tcp"
   echo
-  echo "Посмотреть client config:"
-  echo "  cat ${CLIENT_CONF_PATH}"
+  echo "Show client config:"
+  echo "  sudo cat ${CLIENT_CONF_PATH}"
   echo
-  echo "Проверка сервисов:"
-  echo "  systemctl status wg-quick@${WG_IFACE}"
-  echo "  systemctl status 3proxy"
+  echo "Check services:"
+  echo "  sudo systemctl status wg-quick@${WG_IFACE} --no-pager"
+  echo "  sudo systemctl status 3proxy --no-pager"
+  echo
+  echo "Check ports:"
+  echo "  sudo ss -lntup | grep -E '${SOCKS_PORT}|${HTTP_PORT}|${WG_PORT}'"
   echo
 }
 
@@ -450,13 +521,20 @@ main() {
   echo "============================================================"
   echo
 
+  local do_upgrade="yes"
+  if ask_yes_no_default_yes "Upgrade system packages before installation?"; then
+    do_upgrade="yes"
+  else
+    do_upgrade="no"
+  fi
+
   SOCKS_PORT="$(ask_default "SOCKS5 port" "${SOCKS_PORT}")"
   HTTP_PORT="$(ask_default "HTTP proxy port" "${HTTP_PORT}")"
   WG_PORT="$(ask_default "WireGuard UDP port" "${WG_PORT}")"
 
-  valid_port "${SOCKS_PORT}" || die "Некорректный SOCKS_PORT: ${SOCKS_PORT}"
-  valid_port "${HTTP_PORT}" || die "Некорректный HTTP_PORT: ${HTTP_PORT}"
-  valid_port "${WG_PORT}" || die "Некорректный WG_PORT: ${WG_PORT}"
+  valid_port "${SOCKS_PORT}" || die "Invalid SOCKS5 port: ${SOCKS_PORT}"
+  valid_port "${HTTP_PORT}" || die "Invalid HTTP proxy port: ${HTTP_PORT}"
+  valid_port "${WG_PORT}" || die "Invalid WireGuard port: ${WG_PORT}"
 
   local default_user default_pass proxy_user proxy_pass
   default_user="proxyuser"
@@ -465,33 +543,31 @@ main() {
   proxy_user="$(ask_default "Proxy username" "${default_user}")"
   proxy_pass="$(ask_default "Proxy password" "${default_pass}")"
 
-  [[ -n "${proxy_user}" ]] || die "Proxy username пустой"
-  [[ -n "${proxy_pass}" ]] || die "Proxy password пустой"
+  [[ -n "${proxy_user}" ]] || die "Proxy username is empty"
+  [[ -n "${proxy_pass}" ]] || die "Proxy password is empty"
 
-  if [[ "${proxy_pass}" == *":"* ]]; then
-    die "Пароль не должен содержать двоеточие ':'"
+  if [[ "${proxy_user}" == *":"* ]]; then
+    die "Proxy username must not contain ':'"
   fi
 
-  install_packages
+  if [[ "${proxy_pass}" == *":"* ]]; then
+    die "Proxy password must not contain ':'"
+  fi
+
+  install_packages "${do_upgrade}"
   create_swap_if_needed
+  stop_old_services
+  backup_old_configs
 
-  local public_ip iface private_ip
+  local public_ip
   public_ip="$(detect_public_ip)"
-  iface="$(detect_default_iface)"
-  [[ -n "${iface}" ]] || die "Не смог определить default network interface"
-
-  private_ip="$(detect_private_ip "${iface}")"
-  [[ -n "${private_ip}" ]] || die "Не смог определить private IP интерфейса ${iface}"
 
   info "Public IP: ${public_ip}"
-  info "Default interface: ${iface}"
-  info "External/private interface IP for 3proxy: ${private_ip}"
 
   configure_sysctl
   install_3proxy
-  configure_wireguard
-  patch_client_config_endpoint "${public_ip}"
-  configure_3proxy "${proxy_user}" "${proxy_pass}" "${private_ip}"
+  configure_wireguard "${public_ip}"
+  configure_3proxy "${proxy_user}" "${proxy_pass}"
   configure_firewall
   start_services
   write_info_file "${public_ip}" "${proxy_user}" "${proxy_pass}"
